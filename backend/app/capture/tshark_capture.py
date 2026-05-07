@@ -4,6 +4,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from app.capture.wireshark_tools import discover_wireshark_tool
+
 
 class CaptureRequest(BaseModel):
     interface: str = Field(..., description="Network interface name or index for tshark")
@@ -24,8 +26,9 @@ class CaptureCommand(BaseModel):
 
 
 class TsharkCapture:
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(self, output_dir: Path, tshark_path: str | None = None) -> None:
         self.output_dir = output_dir
+        self.tshark_path = tshark_path or discover_wireshark_tool("tshark")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def build_command(self, request: CaptureRequest) -> CaptureCommand:
@@ -33,7 +36,7 @@ class TsharkCapture:
         pcap_path = self.output_dir / name
 
         command = [
-            "tshark",
+            self.tshark_path,
             "-i",
             request.interface,
             "-a",

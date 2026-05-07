@@ -109,6 +109,29 @@ Expected MCP capabilities:
 
 If the MCP server can return HTTP transactions directly, convert them into `HttpExchange` and skip pcap parsing.
 
+## Local Wireshark workflow
+
+The backend can now drive the local Wireshark CLI toolchain directly. The stable automation path is `tshark`/`dumpcap`
+for capture and analysis, with the Wireshark desktop UI used only as an optional viewer for saved `.pcapng` files.
+
+Useful endpoints:
+
+```text
+GET  /capture/diagnostics
+GET  /capture/interfaces
+POST /capture/session/start
+GET  /capture/session
+GET  /capture/session/{session_id}
+POST /capture/session/{session_id}/stop
+POST /capture/open-wireshark
+POST /parse/pcap/analyze
+POST /parse/pcap/http-exchanges
+```
+
+If `tshark -D` cannot list interfaces on Windows, start or repair Npcap with administrator privileges before attempting
+live capture. HTTPS API extraction from pcap requires browser TLS key logging via `SSLKEYLOGFILE`; without it, use HAR
+capture or expect only DNS/TLS metadata.
+
 ## Workflow example
 
 ```json
@@ -144,6 +167,84 @@ Post it to:
 ```text
 POST /workflow/run
 ```
+
+## Browser automation workflow
+
+For campus workflows such as leave requests, entry reporting, or other stateful web forms, prefer Playwright browser
+automation first. It keeps the real browser login/session/CSRF behavior intact, then records network responses as
+supporting evidence.
+
+Install browser binaries after installing Python dependencies:
+
+```powershell
+cd backend
+.\venv\Scripts\python -m playwright install chromium
+```
+
+Save login state once:
+
+```text
+POST /browser/auth/save
+```
+
+Example body:
+
+```json
+{
+  "url": "https://example.edu/login",
+  "state_path": "E:\\cursor_workspace\\wireshark-ai-demo\\data\\auth\\campus.json",
+  "headless": false,
+  "wait_seconds": 120,
+  "save_when_url_contains": "example.edu"
+}
+```
+
+During the wait window, log in manually in the opened browser. The backend saves the authenticated browser state when
+the timer ends.
+
+For QR-code login flows such as CSDN, use a URL condition so the state is saved soon after the login redirect:
+
+```json
+{
+  "url": "https://passport.csdn.net/login",
+  "state_path": "E:\\cursor_workspace\\wireshark-ai-demo\\data\\auth\\csdn.json",
+  "headless": false,
+  "wait_seconds": 300,
+  "save_when_url_contains": "www.csdn.net"
+}
+```
+
+Run a browser workflow:
+
+```text
+POST /browser/workflow/run
+```
+
+Example:
+
+```json
+{
+  "workflow": {
+    "base_url": "https://example.edu",
+    "auth_state": "E:\\cursor_workspace\\wireshark-ai-demo\\data\\auth\\campus.json",
+    "headless": false,
+    "steps": [
+      {"id": "open", "type": "goto", "url": "/leave/apply"},
+      {"id": "start", "type": "fill", "selector": "input[name='startDate']", "value": "{{input.start_date}}"},
+      {"id": "reason", "type": "fill", "selector": "textarea[name='reason']", "value": "{{input.reason}}"},
+      {"id": "submit", "type": "click", "selector": "button[type='submit']"},
+      {"id": "success", "type": "expect_text", "text": "提交成功"},
+      {"id": "shot", "type": "screenshot", "name": "leave-success.png"}
+    ]
+  },
+  "inputs": {
+    "start_date": "2026-05-08",
+    "reason": "demo"
+  }
+}
+```
+
+After a workflow is reliable in the browser, stable non-interactive API calls can be moved to `POST /workflow/run`.
 
 ## Next implementation steps
 
