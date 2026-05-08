@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from app.automation.templating import render_value
+from app.secrets.vault import SessionSecretVault
 
 
 logger = logging.getLogger("app.browser")
@@ -48,8 +49,9 @@ class BrowserWorkflowResult(BaseModel):
 
 
 class BrowserWorkflowRunner:
-    def __init__(self, artifact_dir: Path) -> None:
+    def __init__(self, artifact_dir: Path, vault: SessionSecretVault | None = None) -> None:
         self.artifact_dir = artifact_dir
+        self.vault = vault
 
     async def save_auth_state(self, request: BrowserAuthRequest) -> dict[str, str]:
         playwright = _load_playwright()
@@ -88,7 +90,26 @@ class BrowserWorkflowRunner:
         headless = bool(workflow.get("headless", True))
         timeout_ms = int(workflow.get("timeout_ms", 30000))
         auth_state = workflow.get("auth_state")
+        auth_secret_ref = workflow.get("auth_secret_ref")
         save_auth_state = workflow.get("save_auth_state")
+        allowed_domains = workflow.get("allowed_domains", [])
+        dry_run = bool(workflow.get("dry_run", False))
+        if dry_run:
+            return BrowserWorkflowResult(
+                results=[
+                    BrowserStepResult(
+                        id=str(step.get("id") or f"step_{index + 1}"),
+                        type=str(step.get("type", "")),
+                        ok=True,
+                        detail="dry_run",
+                    )
+                    for index, step in enumerate(workflow.get("steps", []))
+                ],
+                network=[],
+                screenshots=[],
+            )
+        if not allowed_domains:
+            raise ValueError("allowed_domains is required before browser workflow execution")
 
         async with playwright() as p:
             logger.info(
@@ -99,7 +120,9 @@ class BrowserWorkflowRunner:
             )
             browser = await p.chromium.launch(headless=headless)
             browser_context_kwargs: dict[str, Any] = {}
-            if auth_state:
+            if auth_secret_ref:
+                browser_context_kwargs["storage_state"] = self._storage_state_from_secret(auth_secret_ref)
+            elif auth_state:
                 browser_context_kwargs["storage_state"] = str(auth_state)
             browser_context = await browser.new_context(**browser_context_kwargs)
             browser_context.set_default_timeout(timeout_ms)
@@ -112,7 +135,7 @@ class BrowserWorkflowRunner:
                 step_type = str(step.get("type", ""))
                 logger.info("browser workflow step start id=%s type=%s", step_id, step_type)
                 try:
-                    detail = await self._run_step(page, base_url, step, context_data, screenshots)
+                    detail = await self._run_step(page, base_url, step, context_data, screenshots, allowed_domains)
                     context_data["steps"][step_id] = {"ok": True, "detail": detail}
                     results.append(BrowserStepResult(id=step_id, type=step_type, ok=True, detail=detail))
                     logger.info("browser workflow step ok id=%s type=%s detail=%s", step_id, step_type, detail)
@@ -155,6 +178,7 @@ class BrowserWorkflowRunner:
         step: dict[str, Any],
         context: dict[str, Any],
         screenshots: list[str],
+        allowed_domains: list[str],
     ) -> str | None:
         step_type: Literal[
             "goto",
@@ -172,6 +196,7 @@ class BrowserWorkflowRunner:
 
         if step_type == "goto":
             url = _join_url(base_url, str(render_value(step["url"], context)))
+            _ensure_allowed_url(url, allowed_domains)
             await page.goto(url)
             return url
         if step_type == "fill":
@@ -215,6 +240,15 @@ class BrowserWorkflowRunner:
         path = self.artifact_dir / safe_name
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _storage_state_from_secret(self, auth_secret_ref: str) -> dict[str, Any]:
+        if self.vault is None:
+            raise ValueError("A session vault is required when auth_secret_ref is used")
+        data = self.vault.read_data(_secret_id(auth_secret_ref))
+        state = data.get("storage_state")
+        if not isinstance(state, dict):
+            raise ValueError("Session secret does not contain a Playwright storage_state")
+        return state
 
     async def _wait_for_auth_completion(self, page: Any, request: BrowserAuthRequest) -> None:
         timeout_ms = request.wait_seconds * 1000
@@ -266,3 +300,18 @@ def _network_record(response: Any) -> BrowserNetworkRecord:
         resource_type=request.resource_type,
         content_type=response.headers.get("content-type"),
     )
+
+
+def _secret_id(secret_ref: str) -> str:
+    value = secret_ref.strip()
+    if value.startswith("{{") and value.endswith("}}"):
+        value = value[2:-2].strip()
+    return value.split(".")[-1]
+
+
+def _ensure_allowed_url(url: str, allowed_domains: list[str]) -> None:
+    from urllib.parse import urlparse
+
+    host = urlparse(url).netloc
+    if host and host not in allowed_domains:
+        raise ValueError(f"Browser workflow target is outside allowed_domains: {host}")

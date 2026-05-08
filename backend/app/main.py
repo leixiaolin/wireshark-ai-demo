@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from app.analyzer.api_discovery import ApiDiscoveryAnalyzer
 from app.analyzer.openapi_builder import OpenApiBuilder
+from app.analyzer.schema_inference import infer_exchange_schemas
 from app.automation.browser_runner import BrowserAuthRequest, BrowserWorkflowRequest, BrowserWorkflowRunner
 from app.automation.http_runner import HttpWorkflowRunner
 from app.capture.session_manager import CaptureSession, CaptureSessionManager
@@ -15,6 +16,8 @@ from app.parser.har_parser import HarParser
 from app.parser.normalizer import HttpExchange
 from app.parser.pcap_parser import PcapAnalysisRequest, PcapAnalysisResult, PcapParser
 from app.parser.redactor import TrafficRedactor
+from app.recording.manager import RecordingManager, RecordingRecord, RecordingStartRequest, RecordingStatus
+from app.secrets.vault import SessionSecretCreate, SessionSecretInfo, SessionSecretVault
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -25,8 +28,12 @@ app = FastAPI(title="Wireshark AI API Discovery Demo")
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 PCAP_DIR = DATA_DIR / "pcaps"
 BROWSER_ARTIFACT_DIR = DATA_DIR / "browser"
+RECORDING_DIR = DATA_DIR / "recordings"
+SECRETS_DIR = DATA_DIR / "secrets"
 TOOLCHAIN = WiresharkToolchain()
 SESSION_MANAGER = CaptureSessionManager(output_dir=PCAP_DIR)
+VAULT = SessionSecretVault(SECRETS_DIR)
+RECORDINGS = RecordingManager(RECORDING_DIR, VAULT)
 
 
 @app.middleware("http")
@@ -132,13 +139,13 @@ def parse_pcap_http_exchanges(request: PcapAnalysisRequest) -> list[HttpExchange
 
 @app.post("/analyze/exchanges")
 def analyze_exchanges(exchanges: list[HttpExchange]) -> dict[str, Any]:
-    redacted = TrafficRedactor().redact_many(exchanges)
+    redacted = TrafficRedactor().redact_many([infer_exchange_schemas(exchange) for exchange in exchanges])
     return ApiDiscoveryAnalyzer().analyze(redacted).model_dump()
 
 
 @app.post("/openapi")
 def build_openapi(exchanges: list[HttpExchange]) -> dict[str, Any]:
-    redacted = TrafficRedactor().redact_many(exchanges)
+    redacted = TrafficRedactor().redact_many([infer_exchange_schemas(exchange) for exchange in exchanges])
     result = ApiDiscoveryAnalyzer().analyze(redacted)
     return OpenApiBuilder().build(result)
 
@@ -149,14 +156,17 @@ async def run_workflow(payload: dict[str, Any]) -> dict[str, Any]:
     inputs = payload.get("inputs", {})
     if not isinstance(workflow, dict):
         raise HTTPException(status_code=400, detail="workflow must be an object")
-    return await HttpWorkflowRunner().run(workflow, inputs)
+    try:
+        return await HttpWorkflowRunner(VAULT).run(workflow, inputs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/browser/auth/save")
 async def save_browser_auth(request: BrowserAuthRequest) -> dict[str, str]:
     try:
         logger.info("browser auth endpoint state_path=%s url=%s", request.state_path, request.url)
-        return await BrowserWorkflowRunner(BROWSER_ARTIFACT_DIR).save_auth_state(request)
+        return await BrowserWorkflowRunner(BROWSER_ARTIFACT_DIR, VAULT).save_auth_state(request)
     except Exception as exc:
         logger.exception("browser auth endpoint failed")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -166,7 +176,95 @@ async def save_browser_auth(request: BrowserAuthRequest) -> dict[str, str]:
 async def run_browser_workflow(request: BrowserWorkflowRequest) -> dict[str, Any]:
     try:
         logger.info("browser workflow endpoint steps=%s", len(request.workflow.get("steps", [])))
-        return (await BrowserWorkflowRunner(BROWSER_ARTIFACT_DIR).run(request.workflow, request.inputs)).model_dump()
+        return (await BrowserWorkflowRunner(BROWSER_ARTIFACT_DIR, VAULT).run(request.workflow, request.inputs)).model_dump()
     except Exception as exc:
         logger.exception("browser workflow endpoint failed")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/recording/start")
+async def start_recording(request: RecordingStartRequest) -> RecordingStatus:
+    try:
+        return await RECORDINGS.start(request)
+    except Exception as exc:
+        logger.exception("recording start failed")
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/recording/{recording_id}/stop")
+async def stop_recording(recording_id: str) -> RecordingRecord:
+    try:
+        return await RECORDINGS.stop(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("recording stop failed")
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/recording/{recording_id}")
+def get_recording(recording_id: str) -> RecordingRecord:
+    try:
+        return RECORDINGS.get(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/recording/{recording_id}/analyze")
+def analyze_recording(recording_id: str) -> dict[str, Any]:
+    try:
+        return RECORDINGS.analyze(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/recording/{recording_id}/apis")
+def recording_apis(recording_id: str) -> dict[str, Any]:
+    try:
+        return RECORDINGS.apis(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/recording/{recording_id}/openapi")
+def recording_openapi(recording_id: str) -> dict[str, Any]:
+    try:
+        result = ApiDiscoveryAnalyzer().analyze(RECORDINGS.get(recording_id).redacted_exchanges)
+        return OpenApiBuilder().build(result)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/recording/{recording_id}/workflow/browser")
+def recording_browser_workflow(recording_id: str) -> dict[str, Any]:
+    try:
+        return RECORDINGS.browser_workflow(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/recording/{recording_id}/workflow/http")
+def recording_http_workflow(recording_id: str) -> dict[str, Any]:
+    try:
+        return RECORDINGS.http_workflow(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/secrets/session")
+def create_session_secret(request: SessionSecretCreate) -> SessionSecretInfo:
+    return VAULT.create(request)
+
+
+@app.get("/secrets/session")
+def list_session_secrets() -> list[SessionSecretInfo]:
+    return VAULT.list()
+
+
+@app.delete("/secrets/session/{secret_id}")
+def delete_session_secret(secret_id: str) -> dict[str, str]:
+    try:
+        VAULT.delete(secret_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "deleted", "id": secret_id}

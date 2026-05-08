@@ -18,6 +18,12 @@ class ApiEndpoint(BaseModel):
     request_content_types: list[str] = Field(default_factory=list)
     response_content_types: list[str] = Field(default_factory=list)
     auth_signals: list[str] = Field(default_factory=list)
+    query_schema: dict[str, str] = Field(default_factory=dict)
+    request_body_schema: dict[str, Any] | None = None
+    response_body_schema: dict[str, Any] | None = None
+    operation_type: str = "read"
+    replay_risk: str = "low"
+    dependencies: list[str] = Field(default_factory=list)
 
 
 class ApiDiscoveryResult(BaseModel):
@@ -81,6 +87,12 @@ class ApiDiscoveryAnalyzer:
             request_content_types=request_types,
             response_content_types=response_types,
             auth_signals=auth_signals,
+            query_schema=_query_schema(samples),
+            request_body_schema=_first_schema(sample.request_body_schema for sample in samples),
+            response_body_schema=_first_schema(sample.response_body_schema for sample in samples),
+            operation_type="write" if method.upper() in {"POST", "PUT", "PATCH", "DELETE"} else "read",
+            replay_risk=_replay_risk(method, auth_signals, samples),
+            dependencies=_dependencies(samples),
         )
 
 
@@ -94,3 +106,36 @@ def _template_path(path: str) -> str:
         else:
             parts.append(part)
     return "/" + "/".join(parts) if parts and parts != [""] else "/"
+
+
+def _query_schema(samples: list[HttpExchange]) -> dict[str, str]:
+    schema: dict[str, str] = {}
+    for sample in samples:
+        for key, values in sample.query.items():
+            first = values[0] if values else ""
+            schema[key] = "integer" if first.isdigit() else "string"
+    return schema
+
+
+def _first_schema(values: Any) -> dict[str, Any] | None:
+    for value in values:
+        if value is not None:
+            return value.model_dump()
+    return None
+
+
+def _replay_risk(method: str, auth_signals: list[str], samples: list[HttpExchange]) -> str:
+    secret_ref_count = sum(len(sample.secret_refs) for sample in samples)
+    if method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and (auth_signals or secret_ref_count):
+        return "high"
+    if auth_signals or secret_ref_count:
+        return "medium"
+    return "low"
+
+
+def _dependencies(samples: list[HttpExchange]) -> list[str]:
+    deps = set()
+    for sample in samples:
+        for placeholder in sample.secret_refs.values():
+            deps.add(placeholder)
+    return sorted(deps)

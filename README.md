@@ -246,6 +246,60 @@ Example:
 
 After a workflow is reliable in the browser, stable non-interactive API calls can be moved to `POST /workflow/run`.
 
+## Playwright recording and encrypted session vault
+
+The preferred v1 path is browser recording. It saves real login state locally in an encrypted vault, while analysis
+outputs only redacted placeholders such as `{{secrets.session.cookie}}` or `{{secrets.session.<id>}}`.
+
+Start a recording:
+
+```text
+POST /recording/start
+```
+
+Example body:
+
+```json
+{
+  "url": "https://example.com/editor",
+  "name": "example-post-flow",
+  "headless": false,
+  "allowed_domains": ["example.com"]
+}
+```
+
+Log in and perform the authorized business operation in the opened browser, then stop the recording:
+
+```text
+POST /recording/{id}/stop
+```
+
+Useful recording artifacts:
+
+```text
+GET  /recording/{id}
+POST /recording/{id}/analyze
+GET  /recording/{id}/apis
+GET  /recording/{id}/openapi
+GET  /recording/{id}/workflow/browser
+GET  /recording/{id}/workflow/http
+```
+
+Session vault endpoints:
+
+```text
+POST   /secrets/session
+GET    /secrets/session
+DELETE /secrets/session/{id}
+```
+
+Execution safety controls:
+
+- `allowed_domains` is required before browser or HTTP workflow execution.
+- `dry_run` previews planned HTTP/browser steps without submitting requests.
+- `confirm_write` or `unattended` is required for non-dry-run HTTP write methods.
+- Passwords are not saved by the recorder; use the saved post-login browser state instead.
+
 ## Next implementation steps
 
 1. Wire `PlaceholderWiresharkMcpClient` to the actual wireshark-mcp tool.
